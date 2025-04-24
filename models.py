@@ -7,6 +7,7 @@ import numpy as np
 from torch.autograd import Variable
 
 from chamferdist import ChamferDistance
+from utils import JumpReLU
 
 class PCEncoderNet(nn.Module):
     def __init__(self, opt):
@@ -16,28 +17,36 @@ class PCEncoderNet(nn.Module):
         self.hidden_rep_dim = opt.hidden_rep_dim
         self.batch_size = opt.batch_size
         
-        self.conv1 = nn.Conv1d(3, 128, 1)
-        self.conv2 = nn.Conv1d(128, 128, 1)
+        self.conv1 = nn.Conv1d(3, 64, 1)
+        self.conv2 = nn.Conv1d(64, 128, 1)
         self.conv3 = nn.Conv1d(128, 256, 1)
-        self.conv4 = nn.Conv1d(256, self.hidden_rep_dim, 1)
-        self.bn1 = nn.BatchNorm1d(128)
+        self.conv4 = nn.Conv1d(256, 512, 1)
+        self.conv5 = nn.Conv1d(512, self.hidden_rep_dim, 1)
+        self.bn1 = nn.BatchNorm1d(64)
         self.bn2 = nn.BatchNorm1d(128)
         self.bn3 = nn.BatchNorm1d(256)
-        self.bn4 = nn.BatchNorm1d(self.hidden_rep_dim)
+        self.bn4 = nn.BatchNorm1d(512)
+        self.bn5 = nn.BatchNorm1d(self.hidden_rep_dim)
+        
+        self.bn6 = nn.BatchNorm1d(self.hidden_rep_dim)
+        # self.bn6 = nn.LayerNorm([self.hidden_rep_dim])
         
         self.fc = nn.Linear(self.hidden_rep_dim, self.hidden_rep_dim)
          
-        self.optimizer = optim.SGD(self.parameters(), lr=opt.lr, momentum=opt.momentum)
+        self.optimizer = optim.Adam(self.parameters(), lr=opt.lr)
         
     def forward(self, x):
         x = F.relu(self.bn1(self.conv1(x)))
         x = F.relu(self.bn2(self.conv2(x)))
         x = F.relu(self.bn3(self.conv3(x)))
-        x = self.bn4(self.conv4(x))
+        x = F.relu(self.bn4(self.conv4(x)))
+        x = self.bn5(self.conv5(x))
         
         x = torch.max(x, 2, keepdim=True)[0]
             
-        x = F.relu(self.fc(torch.flatten(x, 1)))
+        x = F.tanh(self.fc(torch.flatten(x, 1)))
+        # x = self.bn6(F.relu(self.fc(torch.flatten(x, 1))))
+        # x = F.relu(self.fc(torch.flatten(x, 1)))
         
         return x
     
@@ -58,20 +67,72 @@ class SAENet(nn.Module):
         
         self.sae1 = nn.Linear(self.hidden_rep_dim, self.sae_dim)
         self.sae2 = nn.Linear(self.sae_dim, self.hidden_rep_dim)
-        
-        self.sae1.requires_grad_(False)
-        self.sae2.requires_grad_(False)
 
         with torch.no_grad():
             self.sae1.weight[:, :].copy_(self.sae2.weight.T)
             self.sae1.bias[:].copy_(torch.zeros(self.sae_dim).cuda())
             self.sae2.bias[:].copy_(torch.zeros(self.hidden_rep_dim).cuda())
         
-        self.optimizer = optim.Adam(self.parameters(), lr=self.opt.lr)        
+        self.optimizer = optim.Adam(self.parameters(), lr=self.opt.sae_lr)        
         
     def forward(self, x):
         _x = x - self.sae2.bias
         f = F.relu(self.sae1(_x))
+        
+        dead_f = torch.zeros_like(f)
+        if self.opt.batch_topk:
+            f = f.flatten()
+            topk, inds = f.topk(self.opt.k * x.size(0))
+            
+            dead_features_inds = self.dead_features.unsqueeze(0).repeat(x.size(0), 1).flatten() >= 5
+            dead_f = torch.zeros_like(f)
+            dead_f[dead_features_inds] = f[dead_features_inds]
+            dead_topk, dead_inds = dead_f.topk(min((dead_features_inds != 0).sum(), self.opt.dead_k * x.size(0)))
+            
+            f = torch.zeros_like(f)
+            dead_f = torch.zeros_like(f)
+            
+            f[inds] = topk
+            f = f.unflatten(0, (x.size(0), -1))
+            
+            dead_f[dead_inds] = dead_topk
+            dead_f = dead_f.unflatten(0, (x.size(0), -1))
+            
+        _x = self.sae2(f)
+        dead_x = self.sae2(dead_f)
+        
+        return _x, f, dead_x
+    
+class JumpSAENet(nn.Module):
+    def __init__(self, opt):
+        super().__init__()
+        self.opt = opt
+        
+        self.batch_size = opt.batch_size
+        self.hidden_rep_dim = opt.hidden_rep_dim
+        self.sae_dim = opt.codebook_size
+        self.l1_lambda = opt.l1_lambda
+        self.t = opt.t
+        
+        self.dead_features = torch.zeros((opt.codebook_size))
+        
+        self.recon_criterion = nn.MSELoss()
+        self.l1criterion = nn.L1Loss()
+        
+        self.sae1 = nn.Linear(self.hidden_rep_dim, self.sae_dim)
+        self.sae2 = nn.Linear(self.sae_dim, self.hidden_rep_dim)
+        self.jumpAct = JumpReLU(self.t)
+
+        with torch.no_grad():
+            self.sae1.weight[:, :].copy_(self.sae2.weight.T)
+            self.sae1.bias[:].copy_(torch.zeros(self.sae_dim).cuda())
+            self.sae2.bias[:].copy_(torch.zeros(self.hidden_rep_dim).cuda())
+        
+        self.optimizer = optim.Adam(self.parameters(), lr=self.opt.sae_lr)        
+        
+    def forward(self, x):
+        _x = x - self.sae2.bias
+        f = self.jumpAct(self.sae1(_x))
         
         dead_f = torch.zeros_like(f)
         if self.opt.batch_topk:
@@ -105,12 +166,13 @@ class PCDecoderNet(nn.Module):
         self.batch_size = opt.batch_size
         self.point_size = opt.num_points
         
-        self.dec1 = nn.Linear(self.hidden_rep_dim, 512)
-        self.dec2 = nn.Linear(512, 1024)
+        self.dec1 = nn.Linear(self.hidden_rep_dim, 1024)
+        self.dec2 = nn.Linear(1024, 1024)
         self.dec3 = nn.Linear(1024, self.point_size * 3)
         
         self.criterion = ChamferDistance()
-        self.optimizer = optim.SGD(self.parameters(), lr=opt.lr, momentum=opt.momentum)
+        # self.optimizer = optim.SGD(self.parameters(), lr=opt.lr, momentum=opt.momentum)
+        self.optimizer = optim.Adam(self.parameters(), lr=self.opt.lr)        
        
     def forward(self, x):
         x = F.relu(self.dec1(x))
@@ -166,6 +228,7 @@ class PCClassiferNet(nn.Module):
         self.opt = opt
         self.hidden_rep_dim = opt.hidden_rep_dim
         self.batch_size = opt.batch_size
+        self.point_size = opt.num_points
         
         self.fc1 = nn.Linear(opt.hidden_rep_dim, 512)
         self.fc2 = nn.Linear(512, 128)
@@ -173,14 +236,15 @@ class PCClassiferNet(nn.Module):
         self.fc4 = nn.Linear(64, 55)
         
         self.criterion = nn.CrossEntropyLoss()
-        self.optimizer = optim.SGD(self.parameters(), lr=opt.lr, momentum=opt.momentum)
+        self.optimizer = optim.Adam(self.parameters(), lr=opt.lr)
         
     def forward(self, x):
-        x = F.relu(self.dec1(x))
-        x = F.relu(self.dec2(x))
-        x = self.dec3(x)
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        x = F.relu(self.fc3(x))
+        x = self.fc4(x)
         
-        return x.view(-1, self.point_size, 3)
+        return x
   
 
 class NaivewSAENet(nn.Module):

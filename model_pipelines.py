@@ -3,6 +3,9 @@ from models import get_loss
 
 import numpy as np
 import open3d as o3d
+import cv2
+
+import os
 
 # from pytorch3d.loss import chamfer_distance
 from spconv.pytorch.utils import PointToVoxel
@@ -43,6 +46,7 @@ def trainNet(trainloader, testloader, net, opt):
 def trainAEEncoder(trainloader, encoder, decoder, opt):
     for epoch in range(opt.num_model_epochs):
         running_loss = 0.0
+        running_mmcr_loss = 0.0
         
         for i, data in enumerate(trainloader):
             inputs, labels = data['train_points'].cuda(0), data['cate_idx'].cuda(0)
@@ -56,16 +60,26 @@ def trainAEEncoder(trainloader, encoder, decoder, opt):
             
             running_loss += loss.item()
             
+            if opt.enc_MMCR_loss > 0:
+                S = torch.linalg.svdvals(torch.nn.functional.normalize(latents, dim=1))
+                mmcr_loss = - S.mean() * opt.enc_MMCR_loss
+                loss += mmcr_loss
+                running_mmcr_loss += mmcr_loss.item()
+            
+            
             loss.backward()
             encoder.optimizer.step()
             decoder.optimizer.step()
             
             if i % opt.super_batch_size == opt.super_batch_size - 1:
-                print(f'[{epoch + 1}, {i + 1:5d}] loss: {running_loss / opt.super_batch_size:.3f}')
+                print(f'[{epoch + 1}, {i + 1:5d}] recon_loss: {running_loss / opt.super_batch_size:.3f}')
+                if opt.enc_MMCR_loss > 0:
+                    print(f'MMCR loss: {running_mmcr_loss / opt.super_batch_size:.6f}')
                 
                 running_loss = 0.0
+                running_mmcr_loss = 0.0
         
-        if epoch % 100 == 99:
+        if epoch % 50 == 49:
             torch.save(encoder.state_dict(), opt.encoder_save_path)
             torch.save(decoder.state_dict(), opt.decoder_save_path)
     
@@ -77,6 +91,8 @@ def trainAESAE(trainloader, encoder, sae, opt):
         running_recon_loss = 0.0
         running_l1_loss = 0.0
         running_dead_recon_loss = 0.0
+        running_mmcr_loss = 0.0
+        running_kart_loss = 0.0
         
         features_fired = torch.zeros((opt.codebook_size)).cuda()
         for i, data in enumerate(trainloader):
@@ -88,19 +104,38 @@ def trainAESAE(trainloader, encoder, sae, opt):
             
             recon_loss = sae.recon_criterion(latents, _latents)
             dead_recon_loss = sae.recon_criterion((latents - _latents).clone().detach(), dead_x) * opt.dead_lambda
-            l1_loss = torch.sum(torch.sum(torch.abs(fs), dim=0) * torch.linalg.vector_norm(sae.sae2.weight, ord=1, dim=0))
+            l1_loss = torch.tanh(opt.c * fs * torch.linalg.vector_norm(sae.sae2.weight, ord=1, dim=0).unsqueeze(0).repeat(opt.batch_size, 1)).sum() * opt.lambda_s
             
             features_fired += (fs != 0).sum(dim=0)
             
+            # MMCR paper, negative nuclear norm. Must be independent of magnitude
+            if opt.MMCR_loss > 0:
+                S = torch.linalg.svdvals(torch.nn.functional.normalize(sae.sae2.weight, dim=0))
+                mmcr_loss = - S.mean() * opt.MMCR_loss           
+            
+            # We note that the norm of encoder weights for features that fire are significantly larger (x5) than those of dead features, preventing them from ever being 'selected' by topk.
+            # We thus encourage encoder weight vectors to approach magnitude of one to give features slower to start a boost, and nerf those in the lead. Note that the magnitude selected 
+            # to approach doesn't actually matter, since the magitudes of f are only relevant relative to each other for selection, and can be comepensated for in decoder weights.
+            if opt.KART_loss > 0:
+                kart_loss = torch.sum((sae.sae1.weight.norm(dim=1) - 1) ** 2) * opt.KART_loss
+                
             running_recon_loss += recon_loss.item()
             running_dead_recon_loss += dead_recon_loss.item()
             running_l1_loss += l1_loss.item()
-            
+                        
             if opt.batch_topk:
                 loss = recon_loss + dead_recon_loss
             else:
                 loss = recon_loss + l1_loss
             
+            if opt.MMCR_loss > 0:
+                loss += mmcr_loss
+                running_mmcr_loss += mmcr_loss.item()
+                
+            if opt.KART_loss > 0:
+                loss += kart_loss
+                running_kart_loss += kart_loss.item()
+       
             loss.backward()
             sae.optimizer.step()
             
@@ -111,10 +146,18 @@ def trainAESAE(trainloader, encoder, sae, opt):
                 else:
                     print(f'[{epoch + 1}, {i + 1:5d}] recon loss: {running_recon_loss / opt.super_batch_size:.3f} ' + 
                           f'l1 loss: {running_l1_loss / opt.super_batch_size:.3f}')
+                    
+                if opt.MMCR_loss > 0:
+                    print(f'MMCR loss: {running_mmcr_loss / opt.super_batch_size:.3f}')
+                
+                if opt.KART_loss > 0:
+                    print(f'KART loss: {running_kart_loss / opt.super_batch_size:.3f}')
                 
                 running_recon_loss = 0.0
                 running_dead_recon_loss = 0.0
                 running_l1_loss = 0.0
+                running_mmcr_loss = 0.0
+                running_kart_loss = 0.0
                 
         avg_features_fired = features_fired.sum() / len(trainloader.dataset)
         # dead_features = (features_fired == 0).nonzero()[:, 0]
@@ -127,7 +170,8 @@ def trainAESAE(trainloader, encoder, sae, opt):
         
         sae.dead_features = dead_features
         
-    torch.save(sae.state_dict(), opt.sae_save_path)
+        if epoch % 50 == 49:
+            torch.save(sae.state_dict(), opt.sae_save_path)
     
     return sae
 
@@ -284,10 +328,12 @@ def getVis(visloader, net, opt):
 
 def getAEVis(visloader, encoder, decoder, sae, classifier, opt):
     
-    vis = torch.zeros((opt.batch_size, 16))
+    encoder.eval()
     classifier.eval()
     sae.eval()
     # net.change_stage(0)
+    
+    count = 0
     
     for data in visloader:
         inputs, labels = data['train_points'].cuda(0), data['cate_idx'].cuda(0)
@@ -297,41 +343,95 @@ def getAEVis(visloader, encoder, decoder, sae, classifier, opt):
         _latents, fs, dead_x = sae(latents)
         output = classifier(latents)
         
-        top_fs = torch.topk(fs[0], 16)[0]
+        top_fs, inds = torch.topk(fs[0], 16)
         
-        for f in top_fs:
-            f.backward(retain_graph=True)
+        for i in range(16):
+            if top_fs[i] == 0:
+                continue
+            animateFeatureChange(sae, top_fs[i], decoder, latents, inds[i], i, object_name=str(data['mid'][0][4:]))
+        
+        count += 1
+        # for f in top_fs:
+        #     f.backward(retain_graph=True)
 
-            pc = inputs[0].T.clone().detach()
-            grads = torch.norm(inputs.grad[0], dim=0)
+        #     pc = inputs[0].T.clone().detach()
+        #     grads = torch.norm(inputs.grad[0], dim=0) ** (1/3)
             
-            saliency_map = torch.zeros((pc.size(0))).cuda()
-            for ind in range(pc.size(0)):
-                dists = pc[ind].unsqueeze(0).repeat(pc.size(0), 1) - pc
-                dists = torch.norm(dists, dim=1)
+        #     saliency_map = torch.zeros((pc.size(0))).cuda()
+        #     for ind in range(pc.size(0)):
+        #         dists = pc[ind].unsqueeze(0).repeat(pc.size(0), 1) - pc
+        #         dists = torch.norm(dists, dim=1)
                 
-                n_vx_inds = (dists <= 0.2).nonzero()
-                n_vx_scores = torch.exp(-dists[n_vx_inds])
-                n_vx_scores = n_vx_scores / n_vx_scores.sum()
+        #         n_vx_inds = (dists <= 0.2).nonzero()
+        #         n_vx_scores = torch.exp(-dists[n_vx_inds])
+        #         n_vx_scores = n_vx_scores / n_vx_scores.sum()
                 
-                saliency_map[ind] = torch.sum(grads[n_vx_inds] * n_vx_scores)
+        #         saliency_map[ind] = torch.sum(grads[n_vx_inds] * n_vx_scores)
 
-            saliency_map = (saliency_map / saliency_map.max())
-            saliency_map = saliency_map.clone().cpu().numpy()
+        #     saliency_map = (saliency_map / saliency_map.max())
+        #     saliency_map = saliency_map.clone().cpu().numpy()
         
-            input = pc.cpu().detach().numpy()
+        #     input = pc.cpu().detach().numpy()
+        #     cloud = o3d.geometry.PointCloud()
+        #     cloud.points = o3d.utility.Vector3dVector(input)
+            
+        #     colors = np.zeros(input.shape)
+        #     colors[:, 0] = saliency_map
+        #     # colors[:, 1] = saliency_map
+        #     colors[:, 2] = 1 - saliency_map
+            
+        #     cloud.colors = o3d.utility.Vector3dVector(colors)
+
+def animateFeatureChange(sae, f, decoder, latents, index, rank, frames=60, object_name='test'):
+    
+    frames -= 1
+    vector = sae.sae2.weight[:, index]
+    prop = 0
+    
+    rank = str(rank).zfill(2)
+    
+    if not os.path.exists(f'images/{object_name}/{rank}_{index}_{f:.2f}'):
+        os.makedirs(f'images/{object_name}/{rank}_{index}_{f:.2f}')
+    
+    while prop <= frames:
+        test_latents = latents - vector * f * prop / frames
+        with torch.no_grad():
+            points = decoder(test_latents).cpu().detach().numpy()[0]
+        
+        if prop == 0:
+            vis = o3d.visualization.Visualizer()
+            vis.create_window(visible=False)   
             cloud = o3d.geometry.PointCloud()
-            cloud.points = o3d.utility.Vector3dVector(input)
-            
-            colors = np.zeros(input.shape)
-            colors[:, 0] = saliency_map
-            # colors[:, 1] = saliency_map
-            colors[:, 2] = 1 - saliency_map
-            
-            cloud.colors = o3d.utility.Vector3dVector(colors)
+            cloud.points = o3d.utility.Vector3dVector(points)
+            vis.add_geometry(cloud)
+        cloud.points = o3d.utility.Vector3dVector(points)
+        vis.update_geometry(cloud)
+        vis.poll_events()
+        vis.update_renderer()
+        vis.capture_screen_image(f'images/{object_name}/{rank}_{index}_{f:.2f}/' + str(prop).zfill(3) + '.png')
+        prop += 1
+    
+    vis.destroy_window()
+    
+    imgs = []
+    for i in range(frames+1):
+        imgs.append(cv2.imread(f'images/{object_name}/{rank}_{index}_{f:.2f}/' + str(i).zfill(3) + '.png'))
         
-    return vis
+    height, width, _ = imgs[0].shape
+    
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    video = cv2.VideoWriter(f'images/{object_name}/{rank}_{index}_{f:.2f}/video.avi', fourcc, frames // 4, (width, height))
+    
+    for img in imgs:
+        video.write(img)
         
+    cv2.destroyAllWindows()
+    video.release()
+    
+    for i in range(frames+1):
+        os.remove(f'images/{object_name}/{rank}_{index}_{f:.2f}/' + str(i).zfill(3) + '.png')
+
+    
 def evalNet(trainloader, testloader, net, opt):
     net.eval()
     net.change_stage(0)

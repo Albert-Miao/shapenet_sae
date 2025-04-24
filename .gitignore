@@ -1,4 +1,6 @@
 ShapeNetCore.v2/*
 ShapeNetCore.v2.PC15k/
+8192_npy/
+images/
 __pycache__/
 *.pth
